@@ -1,0 +1,223 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, mixed_precision
+from tensorflow.keras.applications import EfficientNetB4  
+import matplotlib.pyplot as plt
+import os
+import seaborn as sns
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from sklearn.metrics import average_precision_score
+from sklearn.calibration import calibration_curve
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    tf.config.optimizer.set_jit(True)  # Enable XLA
+    mixed_precision.set_global_policy('mixed_float16')
+    tf.config.experimental.set_memory_growth(gpus[0], True)
+    print(f"GPU {gpus[0].name} configured with mixed precision & XLA")
+
+def create_data_pipeline(dataset_path, img_size=380, batch_size=16):
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        dataset_path,
+        validation_split=0.2,
+        subset='training',
+        seed=42,
+        image_size=(img_size, img_size),
+        batch_size=batch_size,
+        color_mode='rgb',
+        label_mode='binary'
+    )
+
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        dataset_path,
+        validation_split=0.2,
+        subset='validation',
+        seed=42,
+        image_size=(img_size, img_size),
+        batch_size=batch_size * 2,
+        color_mode='rgb',
+        label_mode='binary'
+    )
+
+    augmentation = tf.keras.Sequential([
+        layers.RandomRotation(0.15),
+        layers.RandomZoom(0.2),
+        layers.RandomContrast(0.1),
+        layers.RandomBrightness(0.1),
+        layers.GaussianNoise(0.01),
+        layers.RandomCrop(img_size, img_size)
+    ])
+
+    rescale = layers.Rescaling(1. / 255)
+
+    train_ds = train_ds.map(
+        lambda x, y: (augmentation(rescale(x), training=True), y),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    val_ds = val_ds.map(
+        lambda x, y: (rescale(x), y),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    return train_ds.prefetch(tf.data.AUTOTUNE), val_ds.prefetch(tf.data.AUTOTUNE)
+
+def load_test_dataset(test_path, img_size=380, batch_size=16):
+    test_ds = tf.keras.utils.image_dataset_from_directory(
+        test_path,
+        image_size=(img_size, img_size),
+        batch_size=batch_size,
+        color_mode='rgb',
+        label_mode='binary',
+        shuffle=False
+    )
+
+    test_ds = test_ds.map(
+        lambda x, y: (tf.keras.layers.Rescaling(1. / 255)(x), y),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    return test_ds.prefetch(tf.data.AUTOTUNE)
+
+train_ds, val_ds = create_data_pipeline('/content/drive/MyDrive/Dataset/train')
+test_ds = load_test_dataset('/content/drive/MyDrive/Dataset/test')
+
+def build_robust_model(img_size=380):
+    base_model = EfficientNetB4(
+        weights='imagenet',
+        include_top=False,
+        input_shape=(img_size, img_size, 3)
+    )
+
+    for layer in base_model.layers:
+        layer.trainable = True  # Fine-tune all layers
+
+    x = base_model.output
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(0.4)(x)  # Reduced from 0.6
+    x = layers.Dense(512, activation=None)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('swish')(x)
+    x = layers.Dropout(0.3)(x)  # Reduced from 0.5
+
+    outputs = layers.Dense(1, activation='sigmoid', dtype='float32')(x)
+
+    model = models.Model(base_model.input, outputs)
+
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=5e-5,  # Smaller LR for fine-tuning all layers
+        weight_decay=1e-5,
+        global_clipnorm=1.0
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss=tf.keras.losses.BinaryFocalCrossentropy(alpha=0.25, gamma=2.0),
+        metrics=[
+            tf.keras.metrics.AUC(name='auc', curve='PR'),
+            tf.keras.metrics.AUC(name='roc_auc', curve='ROC'),
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            tf.keras.metrics.F1Score(name='f1', threshold=0.5)
+        ]
+    )
+    return model
+
+model = build_robust_model()
+model.summary()
+
+def balance_dataset(dataset, alpha=0.3):
+    def _apply_balance(x, y):
+        pos_mask = tf.cast(y > 0.5, tf.float32)
+        neg_mask = 1.0 - pos_mask
+        sample_weights = alpha * pos_mask + (1 - alpha) * neg_mask
+        return x, y, sample_weights
+    return dataset.map(_apply_balance, tf.data.AUTOTUNE)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_f1',
+        patience=10,
+        mode='max',
+        restore_best_weights=True,
+        min_delta=0.001
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        'best_model.keras',
+        monitor='val_f1',
+        save_best_only=True,
+        mode='max'
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    ),
+    tf.keras.callbacks.TerminateOnNaN()
+]
+
+balanced_train = balance_dataset(train_ds, alpha=0.3)
+
+history = model.fit(
+    balanced_train,
+    epochs=15,
+    validation_data=val_ds,
+    callbacks=callbacks,
+    verbose=1
+)
+def full_model_diagnostics(model, test_ds):
+    # Load best weights
+    model.load_weights('best_model.keras')
+
+    # Quantitative evaluation
+    y_true, y_pred = [], []
+    for batch in test_ds:
+        x, y = batch
+        y_true.extend(y.numpy())
+        y_pred.extend(model.predict(x, verbose=0).flatten())
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    print("\nClassification Report:")
+    print(classification_report(y_true, (y_pred > 0.5).astype(int),
+                                target_names=['Normal', 'Pneumonia']))
+
+    print(f"ROC AUC: {roc_auc_score(y_true, y_pred):.4f}")
+    print(f"PR AUC: {average_precision_score(y_true, y_pred):.4f}")
+
+    # Confusion Matrix Visualization
+    cm = confusion_matrix(y_true, (y_pred > 0.5).astype(int))
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='viridis',
+                xticklabels=['Normal', 'Pneumonia'],
+                yticklabels=['Normal', 'Pneumonia'])
+    plt.title('Confusion Matrix - Final Model')
+    plt.show()
+
+    # Calibration Curve
+    prob_true, prob_pred = calibration_curve(y_true, y_pred, n_bins=10)
+    plt.figure(figsize=(8,6))
+    plt.plot(prob_pred, prob_true, marker='o')
+    plt.plot([0, 1], [0, 1], linestyle='--')
+    plt.xlabel('Mean Predicted Probability')
+    plt.ylabel('Fraction of Positives')
+    plt.title('Calibration Curve')
+    plt.show()
+
+print("\nFinal Model Evaluation:")
+full_model_diagnostics(model, test_ds)
+model.save('pneumonia_detection_prod.keras', save_format='keras')
+
+# Optimized TFLite export
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = lambda: ((x.numpy()) for x, _ in val_ds.take(100))
+tflite_model = converter.convert()
+
+with open('pneumonia_detection.tflite', 'wb') as f:
+    f.write(tflite_model)
+
+print("Production Models Exported Successfully!")
